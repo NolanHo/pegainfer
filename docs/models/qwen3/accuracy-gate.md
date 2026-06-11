@@ -47,9 +47,10 @@ PEGAINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B \
 `tests/lora_peft_parity.rs` invokes `tools/lora/qwen3_lora_live_parity.py`. The script:
 
 - generates a deterministic PEFT-style rank-1 adapter with non-zero bf16 `q_proj` / `v_proj` LoRA tensors;
-- computes the HF/PEFT greedy token trace and selected-token logprobs through the real incremental `past_key_values` path;
-- starts a LoRA-enabled pegainfer server, loads the same adapter through `/v1/load_lora_adapter`, and requests `/v1/completions` using the adapter name as the model;
-- requires exact generated token ids and selected-token logprob deltas within `mean <= 0.08` and `max <= 0.30`;
+- computes both base-disabled and LoRA-enabled HF/PEFT greedy token traces plus selected-token logprobs through the real incremental `past_key_values` path;
+- starts a LoRA-enabled pegainfer server, loads the same adapter through `/v1/load_lora_adapter`, and sends live `/v1/completions` requests for base/no-LoRA, request-level LoRA, then base/no-LoRA again;
+- requires exact generated token ids and selected-token logprob deltas within `mean <= 0.08` and `max <= 0.30` for all three request paths;
+- checks the selected-logprob LoRA-vs-base delta remains aligned with HF/PEFT within `mean <= 0.05` and `max <= 0.12`;
 - also checks the adapter changes HF logits vs the base model, so a zero or inert fixture cannot pass.
 
 Shared A800 validation for issue #332, run through the Ray Client path from `/root/docs/mint/runtime/shared-test-environment`:
@@ -58,10 +59,12 @@ Shared A800 validation for issue #332, run through the Ray Client path from `/ro
 worker: 192.168.40.72 (A800-SXM4-80GB), CUDA_VISIBLE_DEVICES=1
 binary: /vePFS-Mindverse/share/mint/dev/tmp/issue332/pegainfer-qwen3-peft-lora-gate-target/release/pegainfer
 model:  /vePFS-Mindverse/share/huggingface/Qwen3-4B
-json:   /vePFS-Mindverse/share/mint/dev/tmp/issue332/qwen3-lora-live-parity/parity-20260611-022959.json
+json:   /vePFS-Mindverse/share/mint/dev/tmp/issue332/qwen3-lora-peft-gate/strengthened-gate-20260611T030451Z.json
 ```
 
-Result: exact token ids `[911, 264, 3908, 3743, 6941, 444, 10524, 879]`, matching text `" about a young girl named Lila who"`, HF adapter logit delta `0.158203125`, selected-logprob delta mean `0.022457` and max `0.088249` (`mean <= 0.08`, `max <= 0.30`). The run also confirmed the live server loaded the generated adapter via `/v1/load_lora_adapter`.
+Result: exact token ids `[911, 264, 3908, 3743, 6941, 444, 10524, 879]`, matching text `" about a young girl named Lila who"` on base/no-LoRA before the adapter request, request-level LoRA, and base/no-LoRA after the adapter request. The run confirmed the live server loaded the generated adapter via `/v1/load_lora_adapter`.
+
+Numerics: HF adapter logit delta `0.158203125`, HF selected-logprob LoRA-vs-base max delta `0.107457`, pegainfer selected-logprob LoRA-vs-base max delta `0.014914`, and LoRA-vs-base alignment error mean/max `0.035492` / `0.099387` (`mean <= 0.05`, `max <= 0.12`). HF-vs-pegainfer selected-logprob deltas stayed within the shared tolerance on all live paths: base/no-LoRA before mean/max `0.018852` / `0.058338`, request-level LoRA mean/max `0.022457` / `0.088249`, and base/no-LoRA after mean/max `0.018852` / `0.058338` (`mean <= 0.08`, `max <= 0.30`).
 
 One compatibility note from this validation: the OpenAI-compatible completion payload may expose generated token text under `logprobs.tokens` instead of numeric `token_ids`. The parity script accepts numeric `token_ids` when present; otherwise it re-tokenizes the completion text with the same model tokenizer before comparing token ids.
 

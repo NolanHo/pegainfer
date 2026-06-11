@@ -33,10 +33,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--server-url")
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--lora-name", default="parity")
+    parser.add_argument(
+        "--base-model-name",
+        help="OpenAI model name for no-LoRA requests; defaults to --model-path.",
+    )
     parser.add_argument("--scale", type=float, default=0.001)
     parser.add_argument("--logprob-mean-tol", type=float, default=0.08)
     parser.add_argument("--logprob-max-tol", type=float, default=0.30)
+    parser.add_argument("--lora-delta-mean-tol", type=float, default=0.05)
+    parser.add_argument("--lora-delta-max-tol", type=float, default=0.12)
     parser.add_argument("--min-hf-logit-delta", type=float, default=1.0e-6)
+    parser.add_argument("--min-selected-lora-delta", type=float, default=0.01)
     parser.add_argument("--json-out")
     parser.add_argument("--startup-timeout-s", type=float, default=180.0)
     parser.add_argument(
@@ -138,18 +145,46 @@ def hf_peft_reference(
     with torch.no_grad():
         with model.disable_adapter():
             base_logits = model(**inputs).logits[:, -1, :].float()
+            base_output = model.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.eos_token_id,
+            )
         lora_logits = model(**inputs).logits[:, -1, :].float()
         logit_max_abs_diff = (lora_logits - base_logits).abs().max().item()
-        output = model.generate(
+        lora_output = model.generate(
             **inputs,
             max_new_tokens=max_tokens,
             do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
         )
 
-    new_tokens = output[0, inputs["input_ids"].shape[-1] :].tolist()
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    selected_logprobs = hf_selected_logprobs(torch, model, inputs["input_ids"], new_tokens)
+    base_tokens = base_output[0, inputs["input_ids"].shape[-1] :].tolist()
+    lora_tokens = lora_output[0, inputs["input_ids"].shape[-1] :].tolist()
+    base_text = tokenizer.decode(base_tokens, skip_special_tokens=True)
+    lora_text = tokenizer.decode(lora_tokens, skip_special_tokens=True)
+    base_selected_logprobs = hf_selected_logprobs(
+        torch,
+        model,
+        inputs["input_ids"],
+        base_tokens,
+        adapter_enabled=False,
+    )
+    lora_selected_logprobs = hf_selected_logprobs(
+        torch,
+        model,
+        inputs["input_ids"],
+        lora_tokens,
+        adapter_enabled=True,
+    )
+    base_logprobs_on_lora_tokens = hf_selected_logprobs(
+        torch,
+        model,
+        inputs["input_ids"],
+        lora_tokens,
+        adapter_enabled=False,
+    )
 
     del model
     del base
@@ -158,28 +193,52 @@ def hf_peft_reference(
         torch.cuda.empty_cache()
 
     return {
-        "text": text,
-        "token_ids": new_tokens,
-        "selected_logprobs": selected_logprobs,
+        "base": {
+            "text": base_text,
+            "token_ids": base_tokens,
+            "selected_logprobs": base_selected_logprobs,
+        },
+        "lora": {
+            "text": lora_text,
+            "token_ids": lora_tokens,
+            "selected_logprobs": lora_selected_logprobs,
+            "base_selected_logprobs_on_lora_tokens": base_logprobs_on_lora_tokens,
+        },
         "logit_max_abs_diff_vs_base": logit_max_abs_diff,
     }
 
 
-def hf_selected_logprobs(torch, model, prompt_ids, generated_token_ids: list[int]) -> list[float]:
+@contextlib.contextmanager
+def maybe_disable_adapter(model, adapter_enabled: bool):
+    if adapter_enabled:
+        yield
+    else:
+        with model.disable_adapter():
+            yield
+
+
+def hf_selected_logprobs(
+    torch,
+    model,
+    prompt_ids,
+    generated_token_ids: list[int],
+    adapter_enabled: bool,
+) -> list[float]:
     logprobs = []
     with torch.no_grad():
-        outputs = model(input_ids=prompt_ids, use_cache=True)
-        logits = outputs.logits[:, -1, :].float()
-        past_key_values = outputs.past_key_values
-        for index, token_id in enumerate(generated_token_ids):
-            logprob = torch.log_softmax(logits, dim=-1)[0, token_id].item()
-            logprobs.append(float(logprob))
-            if index + 1 == len(generated_token_ids):
-                break
-            next_id = torch.tensor([[token_id]], device=prompt_ids.device, dtype=prompt_ids.dtype)
-            outputs = model(input_ids=next_id, past_key_values=past_key_values, use_cache=True)
+        with maybe_disable_adapter(model, adapter_enabled):
+            outputs = model(input_ids=prompt_ids, use_cache=True)
             logits = outputs.logits[:, -1, :].float()
             past_key_values = outputs.past_key_values
+            for index, token_id in enumerate(generated_token_ids):
+                logprob = torch.log_softmax(logits, dim=-1)[0, token_id].item()
+                logprobs.append(float(logprob))
+                if index + 1 == len(generated_token_ids):
+                    break
+                next_id = torch.tensor([[token_id]], device=prompt_ids.device, dtype=prompt_ids.dtype)
+                outputs = model(input_ids=next_id, past_key_values=past_key_values, use_cache=True)
+                logits = outputs.logits[:, -1, :].float()
+                past_key_values = outputs.past_key_values
     return logprobs
 
 
@@ -410,10 +469,56 @@ def logprob_delta_stats(hf_logprobs: list[float], pegainfer_logprobs: list[float
     }
 
 
+def signed_logprob_deltas(lora_logprobs: list[float], base_logprobs: list[float]) -> list[float]:
+    if len(lora_logprobs) != len(base_logprobs):
+        raise RuntimeError(
+            "mismatched LoRA/base logprob counts: "
+            f"lora={len(lora_logprobs)} base={len(base_logprobs)}"
+        )
+    return [lora - base for lora, base in zip(lora_logprobs, base_logprobs)]
+
+
+def delta_distribution(values: list[float]) -> dict:
+    magnitudes = [abs(value) for value in values]
+    sorted_magnitudes = sorted(magnitudes)
+    mean = sum(magnitudes) / len(magnitudes) if magnitudes else 0.0
+    return {
+        "mean_abs": mean,
+        "p50_abs": percentile(sorted_magnitudes, 0.50),
+        "p99_abs": percentile(sorted_magnitudes, 0.99),
+        "max_abs": max(magnitudes) if magnitudes else 0.0,
+        "signed": values,
+    }
+
+
+def lora_delta_alignment_stats(
+    hf_lora_logprobs: list[float],
+    hf_base_logprobs: list[float],
+    pegainfer_lora_logprobs: list[float],
+    pegainfer_base_logprobs: list[float],
+) -> dict:
+    hf_delta = signed_logprob_deltas(hf_lora_logprobs, hf_base_logprobs)
+    pegainfer_delta = signed_logprob_deltas(pegainfer_lora_logprobs, pegainfer_base_logprobs)
+    alignment_error = [hf - peg for hf, peg in zip(hf_delta, pegainfer_delta)]
+    return {
+        "hf_lora_vs_base": delta_distribution(hf_delta),
+        "pegainfer_lora_vs_base": delta_distribution(pegainfer_delta),
+        "alignment_error": delta_distribution(alignment_error),
+    }
+
+
+def first_choice(response: dict, label: str) -> dict:
+    choices = response.get("choices", [])
+    if not choices:
+        raise RuntimeError(f"{label} response has no choices: {response}")
+    return choices[0]
+
+
 def main() -> int:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[2]
     model_path = Path(args.model_path).resolve()
+    base_model_name = args.base_model_name or args.model_path
     if args.adapter_path:
         adapter_path = Path(args.adapter_path).resolve()
         adapter_path.mkdir(parents=True, exist_ok=True)
@@ -443,9 +548,21 @@ def main() -> int:
                 f"{server_url}/v1/load_lora_adapter",
                 {"lora_name": args.lora_name, "lora_path": str(adapter_path)},
             )
-            completion = pegainfer_completion(
+            base_completion_before = pegainfer_completion(
+                server_url,
+                model_name=base_model_name,
+                prompt=args.prompt,
+                max_tokens=args.max_tokens,
+            )
+            lora_completion = pegainfer_completion(
                 server_url,
                 model_name=args.lora_name,
+                prompt=args.prompt,
+                max_tokens=args.max_tokens,
+            )
+            base_completion_after = pegainfer_completion(
+                server_url,
+                model_name=base_model_name,
                 prompt=args.prompt,
                 max_tokens=args.max_tokens,
             )
@@ -455,17 +572,77 @@ def main() -> int:
         finally:
             stop_server(process)
 
-    choices = completion.get("choices", [])
-    if not choices:
-        raise RuntimeError(f"completion response has no choices: {completion}")
-    choice = choices[0]
-    pegainfer_text = choice.get("text", "")
-    pegainfer_token_ids, pegainfer_logprobs = extract_pegainfer_tokens_and_logprobs(
-        choice,
+    base_choice_before = first_choice(base_completion_before, "base-before")
+    lora_choice = first_choice(lora_completion, "lora")
+    base_choice_after = first_choice(base_completion_after, "base-after")
+    pegainfer_base_text_before = base_choice_before.get("text", "")
+    pegainfer_lora_text = lora_choice.get("text", "")
+    pegainfer_base_text_after = base_choice_after.get("text", "")
+    pegainfer_base_token_ids_before, pegainfer_base_logprobs_before = (
+        extract_pegainfer_tokens_and_logprobs(base_choice_before, model_path)
+    )
+    pegainfer_lora_token_ids, pegainfer_lora_logprobs = extract_pegainfer_tokens_and_logprobs(
+        lora_choice,
         model_path,
     )
-    mismatch = first_token_mismatch(hf["token_ids"], pegainfer_token_ids)
-    logprob_stats = logprob_delta_stats(hf["selected_logprobs"], pegainfer_logprobs)
+    pegainfer_base_token_ids_after, pegainfer_base_logprobs_after = (
+        extract_pegainfer_tokens_and_logprobs(base_choice_after, model_path)
+    )
+    base_mismatch_before = first_token_mismatch(
+        hf["base"]["token_ids"],
+        pegainfer_base_token_ids_before,
+    )
+    lora_mismatch = first_token_mismatch(hf["lora"]["token_ids"], pegainfer_lora_token_ids)
+    base_mismatch_after = first_token_mismatch(
+        hf["base"]["token_ids"],
+        pegainfer_base_token_ids_after,
+    )
+    base_logprob_stats_before = logprob_delta_stats(
+        hf["base"]["selected_logprobs"],
+        pegainfer_base_logprobs_before,
+    )
+    lora_logprob_stats = logprob_delta_stats(
+        hf["lora"]["selected_logprobs"],
+        pegainfer_lora_logprobs,
+    )
+    base_logprob_stats_after = logprob_delta_stats(
+        hf["base"]["selected_logprobs"],
+        pegainfer_base_logprobs_after,
+    )
+    hf_lora_delta = delta_distribution(
+        signed_logprob_deltas(
+            hf["lora"]["selected_logprobs"],
+            hf["lora"]["base_selected_logprobs_on_lora_tokens"],
+        )
+    )
+    base_and_lora_share_tokens = pegainfer_base_token_ids_before == pegainfer_lora_token_ids
+    lora_delta_alignment = None
+    if base_and_lora_share_tokens:
+        lora_delta_alignment = lora_delta_alignment_stats(
+            hf["lora"]["selected_logprobs"],
+            hf["lora"]["base_selected_logprobs_on_lora_tokens"],
+            pegainfer_lora_logprobs,
+            pegainfer_base_logprobs_before,
+        )
+    hf_trace_sensitive = (
+        hf["base"]["token_ids"] != hf["lora"]["token_ids"]
+        or hf_lora_delta["max_abs"] >= args.min_selected_lora_delta
+    )
+    pegainfer_trace_sensitive = (
+        not base_and_lora_share_tokens
+        or (
+            lora_delta_alignment is not None
+            and lora_delta_alignment["pegainfer_lora_vs_base"]["max_abs"]
+            >= args.min_selected_lora_delta
+        )
+    )
+    lora_delta_aligned = (
+        lora_delta_alignment is None
+        or (
+            lora_delta_alignment["alignment_error"]["mean_abs"] <= args.lora_delta_mean_tol
+            and lora_delta_alignment["alignment_error"]["max_abs"] <= args.lora_delta_max_tol
+        )
+    )
     adapter_spec = {
         "rank": 1,
         "lora_alpha": 1,
@@ -477,45 +654,125 @@ def main() -> int:
     summary = {
         "adapter_path": str(adapter_path),
         "adapter_spec": adapter_spec,
-        "hf_text": hf["text"],
-        "hf_token_ids": hf["token_ids"],
-        "hf_selected_logprobs": hf["selected_logprobs"],
+        "hf_base_text": hf["base"]["text"],
+        "hf_base_token_ids": hf["base"]["token_ids"],
+        "hf_base_selected_logprobs": hf["base"]["selected_logprobs"],
+        "hf_lora_text": hf["lora"]["text"],
+        "hf_lora_token_ids": hf["lora"]["token_ids"],
+        "hf_lora_selected_logprobs": hf["lora"]["selected_logprobs"],
+        "hf_base_selected_logprobs_on_lora_tokens": hf["lora"][
+            "base_selected_logprobs_on_lora_tokens"
+        ],
+        "hf_lora_delta": hf_lora_delta,
         "hf_logit_max_abs_diff_vs_base": hf["logit_max_abs_diff_vs_base"],
         "peft_autocast_adapter_dtype": peft_autocast_adapter_dtype,
         "load_response": load_response,
-        "pegainfer_text": pegainfer_text,
-        "pegainfer_token_ids": pegainfer_token_ids,
-        "pegainfer_selected_logprobs": pegainfer_logprobs,
-        "logprob_delta": logprob_stats,
+        "base_model_name": base_model_name,
+        "pegainfer_base_text_before": pegainfer_base_text_before,
+        "pegainfer_base_token_ids_before": pegainfer_base_token_ids_before,
+        "pegainfer_base_selected_logprobs_before": pegainfer_base_logprobs_before,
+        "pegainfer_lora_text": pegainfer_lora_text,
+        "pegainfer_lora_token_ids": pegainfer_lora_token_ids,
+        "pegainfer_lora_selected_logprobs": pegainfer_lora_logprobs,
+        "pegainfer_base_text_after": pegainfer_base_text_after,
+        "pegainfer_base_token_ids_after": pegainfer_base_token_ids_after,
+        "pegainfer_base_selected_logprobs_after": pegainfer_base_logprobs_after,
+        "base_logprob_delta_before": base_logprob_stats_before,
+        "lora_logprob_delta": lora_logprob_stats,
+        "base_logprob_delta_after": base_logprob_stats_after,
+        "lora_delta_alignment": lora_delta_alignment,
         "tolerances": {
             "logprob_mean": args.logprob_mean_tol,
             "logprob_max": args.logprob_max_tol,
+            "lora_delta_mean": args.lora_delta_mean_tol,
+            "lora_delta_max": args.lora_delta_max_tol,
             "min_hf_logit_delta": args.min_hf_logit_delta,
+            "min_selected_lora_delta": args.min_selected_lora_delta,
         },
-        "first_token_mismatch": mismatch,
-        "match": mismatch is None
-        and logprob_stats["mean"] <= args.logprob_mean_tol
-        and logprob_stats["max"] <= args.logprob_max_tol
-        and hf["logit_max_abs_diff_vs_base"] >= args.min_hf_logit_delta,
+        "base_first_token_mismatch_before": base_mismatch_before,
+        "lora_first_token_mismatch": lora_mismatch,
+        "base_first_token_mismatch_after": base_mismatch_after,
+        "hf_trace_sensitive": hf_trace_sensitive,
+        "pegainfer_trace_sensitive": pegainfer_trace_sensitive,
+        "lora_delta_aligned": lora_delta_aligned,
+        "match": base_mismatch_before is None
+        and lora_mismatch is None
+        and base_mismatch_after is None
+        and base_logprob_stats_before["mean"] <= args.logprob_mean_tol
+        and base_logprob_stats_before["max"] <= args.logprob_max_tol
+        and lora_logprob_stats["mean"] <= args.logprob_mean_tol
+        and lora_logprob_stats["max"] <= args.logprob_max_tol
+        and base_logprob_stats_after["mean"] <= args.logprob_mean_tol
+        and base_logprob_stats_after["max"] <= args.logprob_max_tol
+        and hf["logit_max_abs_diff_vs_base"] >= args.min_hf_logit_delta
+        and hf_trace_sensitive
+        and pegainfer_trace_sensitive
+        and lora_delta_aligned,
     }
     summary_json = json.dumps(summary, indent=2, ensure_ascii=False)
     print(summary_json)
     if args.json_out:
         Path(args.json_out).write_text(f"{summary_json}\n", encoding="utf-8")
 
-    if mismatch is not None:
+    if base_mismatch_before is not None:
         print(tail_server_output(process), file=sys.stderr)
-        print(f"token mismatch: {mismatch}", file=sys.stderr)
+        print(f"base-before token mismatch: {base_mismatch_before}", file=sys.stderr)
         return 1
-    if logprob_stats["mean"] > args.logprob_mean_tol:
+    if lora_mismatch is not None:
+        print(tail_server_output(process), file=sys.stderr)
+        print(f"lora token mismatch: {lora_mismatch}", file=sys.stderr)
+        return 1
+    if base_mismatch_after is not None:
+        print(tail_server_output(process), file=sys.stderr)
+        print(f"base-after token mismatch: {base_mismatch_after}", file=sys.stderr)
+        return 1
+    for label, stats in [
+        ("base-before", base_logprob_stats_before),
+        ("lora", lora_logprob_stats),
+        ("base-after", base_logprob_stats_after),
+    ]:
+        if stats["mean"] > args.logprob_mean_tol:
+            print(
+                f"{label} logprob mean delta {stats['mean']:.6f} "
+                f"exceeds {args.logprob_mean_tol:.6f}",
+                file=sys.stderr,
+            )
+            return 1
+        if stats["max"] > args.logprob_max_tol:
+            print(
+                f"{label} logprob max delta {stats['max']:.6f} "
+                f"exceeds {args.logprob_max_tol:.6f}",
+                file=sys.stderr,
+            )
+            return 1
+    if lora_delta_alignment is not None:
+        alignment = lora_delta_alignment["alignment_error"]
+        if alignment["mean_abs"] > args.lora_delta_mean_tol:
+            print(
+                f"LoRA-vs-base delta mean error {alignment['mean_abs']:.6f} "
+                f"exceeds {args.lora_delta_mean_tol:.6f}",
+                file=sys.stderr,
+            )
+            return 1
+        if alignment["max_abs"] > args.lora_delta_max_tol:
+            print(
+                f"LoRA-vs-base delta max error {alignment['max_abs']:.6f} "
+                f"exceeds {args.lora_delta_max_tol:.6f}",
+                file=sys.stderr,
+            )
+            return 1
+    if not hf_trace_sensitive:
         print(
-            f"logprob mean delta {logprob_stats['mean']:.6f} exceeds {args.logprob_mean_tol:.6f}",
+            "HF trace is not LoRA-sensitive: base and LoRA tokens match and selected-logprob "
+            f"delta max {hf_lora_delta['max_abs']:.6f} is below {args.min_selected_lora_delta:.6f}",
             file=sys.stderr,
         )
         return 1
-    if logprob_stats["max"] > args.logprob_max_tol:
+    if not pegainfer_trace_sensitive:
         print(
-            f"logprob max delta {logprob_stats['max']:.6f} exceeds {args.logprob_max_tol:.6f}",
+            "pegainfer trace is not LoRA-sensitive: base and LoRA tokens match and selected-logprob "
+            f"delta max {lora_delta_alignment['pegainfer_lora_vs_base']['max_abs']:.6f} "
+            f"is below {args.min_selected_lora_delta:.6f}",
             file=sys.stderr,
         )
         return 1
