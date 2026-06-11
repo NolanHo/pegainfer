@@ -756,13 +756,6 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-    if base_repeat_logprob_delta["max"] > args.base_repeat_logprob_max_tol:
-        print(
-            f"base repeat logprob max delta {base_repeat_logprob_delta['max']:.9f} "
-            f"exceeds {args.base_repeat_logprob_max_tol:.9f}",
-            file=sys.stderr,
-        )
-        return 1
         if stats["max"] > args.logprob_max_tol:
             print(
                 f"{label} logprob max delta {stats['max']:.6f} "
@@ -770,6 +763,13 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+    if base_repeat_logprob_delta["max"] > args.base_repeat_logprob_max_tol:
+        print(
+            f"base repeat logprob max delta {base_repeat_logprob_delta['max']:.9f} "
+            f"exceeds {args.base_repeat_logprob_max_tol:.9f}",
+            file=sys.stderr,
+        )
+        return 1
     if lora_delta_alignment is not None:
         alignment = lora_delta_alignment["alignment_error"]
         if alignment["mean_abs"] > args.lora_delta_mean_tol:

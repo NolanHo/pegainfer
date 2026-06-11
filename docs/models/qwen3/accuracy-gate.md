@@ -60,7 +60,7 @@ Shared A800 validation for issue #332, run through the Ray Client path from `/ro
 worker: 192.168.40.72 (A800-SXM4-80GB), CUDA_VISIBLE_DEVICES=1
 binary: /vePFS-Mindverse/share/mint/dev/tmp/issue332/pegainfer-qwen3-peft-lora-gate-target/release/pegainfer
 model:  /vePFS-Mindverse/share/huggingface/Qwen3-4B
-json:   /vePFS-Mindverse/share/mint/dev/tmp/issue332/qwen3-lora-peft-gate/strengthened-gate-20260611T031109Z.json
+json:   /vePFS-Mindverse/share/mint/dev/tmp/issue332/qwen3-lora-peft-gate/strengthened-gate-20260611T031503Z.json
 ```
 
 Result: exact token ids `[911, 264, 3908, 3743, 6941, 444, 10524, 879]`, matching text `" about a young girl named Lila who"` on base/no-LoRA before the adapter request, request-level LoRA, and base/no-LoRA after the adapter request. The run confirmed the live server loaded the generated adapter via `/v1/load_lora_adapter`.
