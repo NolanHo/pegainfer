@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logprob-max-tol", type=float, default=0.30)
     parser.add_argument("--lora-delta-mean-tol", type=float, default=0.05)
     parser.add_argument("--lora-delta-max-tol", type=float, default=0.12)
+    parser.add_argument("--base-repeat-logprob-max-tol", type=float, default=1.0e-6)
     parser.add_argument("--min-hf-logit-delta", type=float, default=1.0e-6)
     parser.add_argument("--min-selected-lora-delta", type=float, default=0.01)
     parser.add_argument("--json-out")
@@ -609,6 +610,14 @@ def main() -> int:
         hf["base"]["selected_logprobs"],
         pegainfer_base_logprobs_after,
     )
+    base_repeat_mismatch = first_token_mismatch(
+        pegainfer_base_token_ids_before,
+        pegainfer_base_token_ids_after,
+    )
+    base_repeat_logprob_delta = logprob_delta_stats(
+        pegainfer_base_logprobs_before,
+        pegainfer_base_logprobs_after,
+    )
     hf_lora_delta = delta_distribution(
         signed_logprob_deltas(
             hf["lora"]["selected_logprobs"],
@@ -686,12 +695,15 @@ def main() -> int:
             "logprob_max": args.logprob_max_tol,
             "lora_delta_mean": args.lora_delta_mean_tol,
             "lora_delta_max": args.lora_delta_max_tol,
+            "base_repeat_logprob_max": args.base_repeat_logprob_max_tol,
             "min_hf_logit_delta": args.min_hf_logit_delta,
             "min_selected_lora_delta": args.min_selected_lora_delta,
         },
         "base_first_token_mismatch_before": base_mismatch_before,
         "lora_first_token_mismatch": lora_mismatch,
         "base_first_token_mismatch_after": base_mismatch_after,
+        "base_repeat_first_token_mismatch": base_repeat_mismatch,
+        "base_repeat_logprob_delta": base_repeat_logprob_delta,
         "hf_trace_sensitive": hf_trace_sensitive,
         "pegainfer_trace_sensitive": pegainfer_trace_sensitive,
         "lora_delta_aligned": lora_delta_aligned,
@@ -704,6 +716,8 @@ def main() -> int:
         and lora_logprob_stats["max"] <= args.logprob_max_tol
         and base_logprob_stats_after["mean"] <= args.logprob_mean_tol
         and base_logprob_stats_after["max"] <= args.logprob_max_tol
+        and base_repeat_mismatch is None
+        and base_repeat_logprob_delta["max"] <= args.base_repeat_logprob_max_tol
         and hf["logit_max_abs_diff_vs_base"] >= args.min_hf_logit_delta
         and hf_trace_sensitive
         and pegainfer_trace_sensitive
@@ -726,6 +740,10 @@ def main() -> int:
         print(tail_server_output(process), file=sys.stderr)
         print(f"base-after token mismatch: {base_mismatch_after}", file=sys.stderr)
         return 1
+    if base_repeat_mismatch is not None:
+        print(tail_server_output(process), file=sys.stderr)
+        print(f"base repeat token mismatch: {base_repeat_mismatch}", file=sys.stderr)
+        return 1
     for label, stats in [
         ("base-before", base_logprob_stats_before),
         ("lora", lora_logprob_stats),
@@ -738,6 +756,13 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
+    if base_repeat_logprob_delta["max"] > args.base_repeat_logprob_max_tol:
+        print(
+            f"base repeat logprob max delta {base_repeat_logprob_delta['max']:.9f} "
+            f"exceeds {args.base_repeat_logprob_max_tol:.9f}",
+            file=sys.stderr,
+        )
+        return 1
         if stats["max"] > args.logprob_max_tol:
             print(
                 f"{label} logprob max delta {stats['max']:.6f} "
