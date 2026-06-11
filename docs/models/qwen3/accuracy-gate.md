@@ -52,6 +52,19 @@ PEGAINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B \
 - requires exact generated token ids and selected-token logprob deltas within `mean <= 0.08` and `max <= 0.30`;
 - also checks the adapter changes HF logits vs the base model, so a zero or inert fixture cannot pass.
 
+Shared A800 validation for issue #332, run through the Ray Client path from `/root/docs/mint/runtime/shared-test-environment`:
+
+```text
+worker: 192.168.40.72 (A800-SXM4-80GB), CUDA_VISIBLE_DEVICES=1
+binary: /vePFS-Mindverse/share/mint/dev/tmp/issue332/pegainfer-qwen3-peft-lora-gate-target/release/pegainfer
+model:  /vePFS-Mindverse/share/huggingface/Qwen3-4B
+json:   /vePFS-Mindverse/share/mint/dev/tmp/issue332/qwen3-lora-live-parity/parity-20260611-022959.json
+```
+
+Result: exact token ids `[911, 264, 3908, 3743, 6941, 444, 10524, 879]`, matching text `" about a young girl named Lila who"`, HF adapter logit delta `0.158203125`, selected-logprob delta mean `0.022457` and max `0.088249` (`mean <= 0.08`, `max <= 0.30`). The run also confirmed the live server loaded the generated adapter via `/v1/load_lora_adapter`.
+
+One compatibility note from this validation: the OpenAI-compatible completion payload may expose generated token text under `logprobs.tokens` instead of numeric `token_ids`. The parity script accepts numeric `token_ids` when present; otherwise it re-tokenizes the completion text with the same model tokenizer before comparing token ids.
+
 ## Measured noise floor (RTX 5070 Ti, sm_120)
 
 Verified run, all four passes green in 26s:

@@ -330,17 +330,45 @@ def pegainfer_completion(
     return response
 
 
-def extract_pegainfer_tokens_and_logprobs(choice: dict) -> tuple[list[int], list[float]]:
+def tokenize_completion_text(model_path: Path, text: str) -> list[int]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    return tokenizer.encode(text, add_special_tokens=False)
+
+
+def extract_pegainfer_tokens_and_logprobs(
+    choice: dict,
+    model_path: Path | None = None,
+) -> tuple[list[int], list[float]]:
     logprobs = choice.get("logprobs")
     if not isinstance(logprobs, dict):
         raise RuntimeError(f"completion choice has no logprobs payload: {choice!r}")
 
-    token_ids = logprobs.get("token_ids") or logprobs.get("tokens")
+    token_ids = logprobs.get("token_ids")
     token_logprobs = logprobs.get("token_logprobs")
     if isinstance(token_ids, list) and isinstance(token_logprobs, list):
         if len(token_ids) != len(token_logprobs):
             raise RuntimeError(f"mismatched token/logprob counts: {logprobs!r}")
         return [int(token_id) for token_id in token_ids], [float(lp) for lp in token_logprobs]
+
+    tokens = logprobs.get("tokens")
+    if isinstance(tokens, list) and isinstance(token_logprobs, list):
+        if len(tokens) != len(token_logprobs):
+            raise RuntimeError(f"mismatched token/logprob counts: {logprobs!r}")
+        if all(isinstance(token, int) or str(token).isdigit() for token in tokens):
+            return [int(token) for token in tokens], [float(lp) for lp in token_logprobs]
+        if model_path is None:
+            raise RuntimeError(
+                "completion logprobs contain token text but no token_ids; model_path is required"
+            )
+        parsed_token_ids = tokenize_completion_text(model_path, str(choice.get("text", "")))
+        if len(parsed_token_ids) != len(token_logprobs):
+            raise RuntimeError(
+                "tokenized completion text does not match logprob count: "
+                f"token_ids={parsed_token_ids!r}, logprobs={logprobs!r}"
+            )
+        return parsed_token_ids, [float(lp) for lp in token_logprobs]
 
     positions = logprobs.get("positions")
     if isinstance(positions, list):
@@ -432,7 +460,10 @@ def main() -> int:
         raise RuntimeError(f"completion response has no choices: {completion}")
     choice = choices[0]
     pegainfer_text = choice.get("text", "")
-    pegainfer_token_ids, pegainfer_logprobs = extract_pegainfer_tokens_and_logprobs(choice)
+    pegainfer_token_ids, pegainfer_logprobs = extract_pegainfer_tokens_and_logprobs(
+        choice,
+        model_path,
+    )
     mismatch = first_token_mismatch(hf["token_ids"], pegainfer_token_ids)
     logprob_stats = logprob_delta_stats(hf["selected_logprobs"], pegainfer_logprobs)
     adapter_spec = {
