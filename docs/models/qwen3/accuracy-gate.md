@@ -1,8 +1,8 @@
 # Qwen3-4B accuracy gate
 
-**TL;DR**: Qwen3-4B's logits are guarded by `tests/hf_golden_gate.rs` — a tolerance check against a stored HuggingFace bf16 golden, *not* an exact-text or hash baseline. It teacher-forces 48 fixed sequences and asserts pegainfer's logprobs stay at the bf16 noise floor of HF across bs=1 / batched eager / CUDA-graph. Strict guards: a structural **regret** check on the argmax + **mean** delta ≤ 0.06 nat + **p99** delta ≤ 0.20 nat; the absolute max is printed but not asserted (it is coverage-unstable). This is the reference implementation of the pattern in `subsystems/correctness/logits-golden-gate.md` — read that for the *why*; this doc is the Qwen3-4B *specifics*.
+**TL;DR**: Qwen3-4B's base logits are guarded by `tests/hf_golden_gate.rs` — a tolerance check against a stored HuggingFace bf16 golden, *not* an exact-text or hash baseline. It teacher-forces 48 fixed sequences and asserts pegainfer's logprobs stay at the bf16 noise floor of HF across bs=1 / batched eager / CUDA-graph. Strict guards: a structural **regret** check on the argmax + **mean** delta ≤ 0.06 nat + **p99** delta ≤ 0.20 nat; the absolute max is printed but not asserted (it is coverage-unstable). The LoRA path has a separate ignored PEFT parity gate: `tests/lora_peft_parity.rs` wraps `tools/lora/qwen3_lora_live_parity.py`, which generates a deterministic non-zero PEFT adapter, loads it through `/v1/load_lora_adapter`, and compares request-level adapter tokens plus selected-token logprobs against HF/PEFT.
 
-Last touched: 2026-05
+Last touched: 2026-06
 
 ## The Qwen3-4B instance
 
@@ -34,6 +34,23 @@ The same golden is replayed four ways, all under the same tolerances:
 Eager does **not** pad — `batch_decode.rs` sets `padded_bs = bucket_for(bs)` only when CUDA graph is enabled. So padding-slot isolation is exercised solely by the graph passes; the eager batched pass guards cross-request contamination instead.
 
 This **replaces** the old `executor_equivalence` test, which asserted batched output was *bit-identical* to sequential — a false invariant (the batched decode path is not batch-invariant; batch composition changes the reduction order and drifts logits ~1 ULP). The mean/p99 here are indistinguishable across passes, proving there is no contamination, only reduction-order noise the tolerance absorbs.
+
+## LoRA PEFT parity gate
+
+The zero-adapter LoRA smoke test is only a route/load smoke: it proves the request-level `lora_adapter` path runs, but it cannot catch a missing, transposed, or mis-scaled LoRA delta. The real LoRA correctness gate is:
+
+```bash
+PEGAINFER_TEST_MODEL_PATH=/data/models/Qwen3-4B \
+    cargo test --release -p pegainfer-qwen3-4b --test lora_peft_parity -- --ignored --nocapture
+```
+
+`tests/lora_peft_parity.rs` invokes `tools/lora/qwen3_lora_live_parity.py`. The script:
+
+- generates a deterministic PEFT-style rank-1 adapter with non-zero bf16 `q_proj` / `v_proj` LoRA tensors;
+- computes the HF/PEFT greedy token trace and selected-token logprobs through the real incremental `past_key_values` path;
+- starts a LoRA-enabled pegainfer server, loads the same adapter through `/v1/load_lora_adapter`, and requests `/v1/completions` using the adapter name as the model;
+- requires exact generated token ids and selected-token logprob deltas within `mean <= 0.08` and `max <= 0.30`;
+- also checks the adapter changes HF logits vs the base model, so a zero or inert fixture cannot pass.
 
 ## Measured noise floor (RTX 5070 Ti, sm_120)
 

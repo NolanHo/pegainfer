@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Live Qwen3 LoRA parity check against HuggingFace + PEFT.
+"""Live Qwen3 LoRA parity gate against HuggingFace + PEFT.
 
 The script creates a deterministic PEFT-style adapter, obtains the greedy
-reference text from transformers+peft, loads the same adapter through
-PegaInfer's live /v1/load_lora_adapter route, and compares /v1/completions.
+reference from transformers+peft, loads the same adapter through PegaInfer's
+live /v1/load_lora_adapter route, and compares /v1/completions tokens and
+selected-token logprobs.
 """
 
 from __future__ import annotations
@@ -33,6 +34,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--lora-name", default="parity")
     parser.add_argument("--scale", type=float, default=0.001)
+    parser.add_argument("--logprob-mean-tol", type=float, default=0.08)
+    parser.add_argument("--logprob-max-tol", type=float, default=0.30)
+    parser.add_argument("--min-hf-logit-delta", type=float, default=1.0e-6)
+    parser.add_argument("--json-out")
     parser.add_argument("--startup-timeout-s", type=float, default=180.0)
     parser.add_argument(
         "--disable-peft-adapter-autocast",
@@ -144,6 +149,7 @@ def hf_peft_reference(
 
     new_tokens = output[0, inputs["input_ids"].shape[-1] :].tolist()
     text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    selected_logprobs = hf_selected_logprobs(torch, model, inputs["input_ids"], new_tokens)
 
     del model
     del base
@@ -154,28 +160,33 @@ def hf_peft_reference(
     return {
         "text": text,
         "token_ids": new_tokens,
+        "selected_logprobs": selected_logprobs,
         "logit_max_abs_diff_vs_base": logit_max_abs_diff,
     }
 
 
-def encode_generated_text(model_path: Path, text: str) -> list[int]:
-    from transformers import AutoTokenizer
+def hf_selected_logprobs(torch, model, prompt_ids, generated_token_ids: list[int]) -> list[float]:
+    logprobs = []
+    with torch.no_grad():
+        outputs = model(input_ids=prompt_ids, use_cache=True)
+        logits = outputs.logits[:, -1, :].float()
+        past_key_values = outputs.past_key_values
+        for index, token_id in enumerate(generated_token_ids):
+            logprob = torch.log_softmax(logits, dim=-1)[0, token_id].item()
+            logprobs.append(float(logprob))
+            if index + 1 == len(generated_token_ids):
+                break
+            next_id = torch.tensor([[token_id]], device=prompt_ids.device, dtype=prompt_ids.dtype)
+            outputs = model(input_ids=next_id, past_key_values=past_key_values, use_cache=True)
+            logits = outputs.logits[:, -1, :].float()
+            past_key_values = outputs.past_key_values
+    return logprobs
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    return tokenizer(text, add_special_tokens=False)["input_ids"]
 
-
-def first_token_mismatch(
-    hf_token_ids: list[int],
-    pegainfer_token_ids: list[int],
-    model_path: Path,
-) -> dict | None:
+def first_token_mismatch(hf_token_ids: list[int], pegainfer_token_ids: list[int]) -> dict | None:
     if hf_token_ids == pegainfer_token_ids:
         return None
 
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     for index, (hf_token_id, pegainfer_token_id) in enumerate(
         zip(hf_token_ids, pegainfer_token_ids),
         start=1,
@@ -185,8 +196,6 @@ def first_token_mismatch(
                 "index_1based": index,
                 "hf_token_id": hf_token_id,
                 "pegainfer_token_id": pegainfer_token_id,
-                "hf_piece": tokenizer.decode([hf_token_id]),
-                "pegainfer_piece": tokenizer.decode([pegainfer_token_id]),
             }
 
     return {
@@ -195,12 +204,6 @@ def first_token_mismatch(
         if len(hf_token_ids) > len(pegainfer_token_ids)
         else None,
         "pegainfer_token_id": pegainfer_token_ids[len(hf_token_ids)]
-        if len(pegainfer_token_ids) > len(hf_token_ids)
-        else None,
-        "hf_piece": tokenizer.decode([hf_token_ids[len(pegainfer_token_ids)]])
-        if len(hf_token_ids) > len(pegainfer_token_ids)
-        else None,
-        "pegainfer_piece": tokenizer.decode([pegainfer_token_ids[len(hf_token_ids)]])
         if len(pegainfer_token_ids) > len(hf_token_ids)
         else None,
     }
@@ -319,6 +322,7 @@ def pegainfer_completion(
             "prompt": prompt,
             "max_tokens": max_tokens,
             "temperature": 0,
+            "logprobs": 1,
         },
     )
     if not isinstance(response, dict):
@@ -326,9 +330,61 @@ def pegainfer_completion(
     return response
 
 
+def extract_pegainfer_tokens_and_logprobs(choice: dict) -> tuple[list[int], list[float]]:
+    logprobs = choice.get("logprobs")
+    if not isinstance(logprobs, dict):
+        raise RuntimeError(f"completion choice has no logprobs payload: {choice!r}")
+
+    token_ids = logprobs.get("token_ids") or logprobs.get("tokens")
+    token_logprobs = logprobs.get("token_logprobs")
+    if isinstance(token_ids, list) and isinstance(token_logprobs, list):
+        if len(token_ids) != len(token_logprobs):
+            raise RuntimeError(f"mismatched token/logprob counts: {logprobs!r}")
+        return [int(token_id) for token_id in token_ids], [float(lp) for lp in token_logprobs]
+
+    positions = logprobs.get("positions")
+    if isinstance(positions, list):
+        parsed_token_ids = []
+        parsed_logprobs = []
+        for position in positions:
+            entries = position.get("entries") if isinstance(position, dict) else None
+            if not entries:
+                raise RuntimeError(f"logprob position has no entries: {position!r}")
+            sampled = entries[0]
+            parsed_token_ids.append(int(sampled["token_id"]))
+            parsed_logprobs.append(float(sampled["logprob"]))
+        return parsed_token_ids, parsed_logprobs
+
+    raise RuntimeError(f"unexpected logprobs payload: {logprobs!r}")
+
+
+def percentile(sorted_values: list[float], pct: float) -> float:
+    if not sorted_values:
+        return 0.0
+    index = min(len(sorted_values) - 1, int(round((len(sorted_values) - 1) * pct)))
+    return sorted_values[index]
+
+
+def logprob_delta_stats(hf_logprobs: list[float], pegainfer_logprobs: list[float]) -> dict:
+    if len(hf_logprobs) != len(pegainfer_logprobs):
+        raise RuntimeError(
+            f"mismatched logprob counts: hf={len(hf_logprobs)} pegainfer={len(pegainfer_logprobs)}"
+        )
+    deltas = [abs(hf - peg) for hf, peg in zip(hf_logprobs, pegainfer_logprobs)]
+    sorted_deltas = sorted(deltas)
+    mean = sum(deltas) / len(deltas) if deltas else 0.0
+    return {
+        "mean": mean,
+        "p50": percentile(sorted_deltas, 0.50),
+        "p99": percentile(sorted_deltas, 0.99),
+        "max": max(deltas) if deltas else 0.0,
+        "deltas": deltas,
+    }
+
+
 def main() -> int:
     args = parse_args()
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = Path(__file__).resolve().parents[2]
     model_path = Path(args.model_path).resolve()
     if args.adapter_path:
         adapter_path = Path(args.adapter_path).resolve()
@@ -374,27 +430,65 @@ def main() -> int:
     choices = completion.get("choices", [])
     if not choices:
         raise RuntimeError(f"completion response has no choices: {completion}")
-    pegainfer_text = choices[0].get("text", "")
-    pegainfer_token_ids = encode_generated_text(model_path, pegainfer_text)
-    mismatch = first_token_mismatch(hf["token_ids"], pegainfer_token_ids, model_path)
+    choice = choices[0]
+    pegainfer_text = choice.get("text", "")
+    pegainfer_token_ids, pegainfer_logprobs = extract_pegainfer_tokens_and_logprobs(choice)
+    mismatch = first_token_mismatch(hf["token_ids"], pegainfer_token_ids)
+    logprob_stats = logprob_delta_stats(hf["selected_logprobs"], pegainfer_logprobs)
+    adapter_spec = {
+        "rank": 1,
+        "lora_alpha": 1,
+        "target_modules": ["q_proj", "v_proj"],
+        "scale": args.scale,
+        "seed_base": 1000,
+        "seed_stride_per_layer": 17,
+    }
     summary = {
         "adapter_path": str(adapter_path),
+        "adapter_spec": adapter_spec,
         "hf_text": hf["text"],
         "hf_token_ids": hf["token_ids"],
+        "hf_selected_logprobs": hf["selected_logprobs"],
         "hf_logit_max_abs_diff_vs_base": hf["logit_max_abs_diff_vs_base"],
         "peft_autocast_adapter_dtype": peft_autocast_adapter_dtype,
         "load_response": load_response,
         "pegainfer_text": pegainfer_text,
         "pegainfer_token_ids": pegainfer_token_ids,
+        "pegainfer_selected_logprobs": pegainfer_logprobs,
+        "logprob_delta": logprob_stats,
+        "tolerances": {
+            "logprob_mean": args.logprob_mean_tol,
+            "logprob_max": args.logprob_max_tol,
+            "min_hf_logit_delta": args.min_hf_logit_delta,
+        },
         "first_token_mismatch": mismatch,
-        "match": pegainfer_text == hf["text"],
+        "match": mismatch is None
+        and logprob_stats["mean"] <= args.logprob_mean_tol
+        and logprob_stats["max"] <= args.logprob_max_tol
+        and hf["logit_max_abs_diff_vs_base"] >= args.min_hf_logit_delta,
     }
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    summary_json = json.dumps(summary, indent=2, ensure_ascii=False)
+    print(summary_json)
+    if args.json_out:
+        Path(args.json_out).write_text(f"{summary_json}\n", encoding="utf-8")
 
-    if pegainfer_text != hf["text"]:
+    if mismatch is not None:
         print(tail_server_output(process), file=sys.stderr)
+        print(f"token mismatch: {mismatch}", file=sys.stderr)
         return 1
-    if hf["logit_max_abs_diff_vs_base"] == 0.0:
+    if logprob_stats["mean"] > args.logprob_mean_tol:
+        print(
+            f"logprob mean delta {logprob_stats['mean']:.6f} exceeds {args.logprob_mean_tol:.6f}",
+            file=sys.stderr,
+        )
+        return 1
+    if logprob_stats["max"] > args.logprob_max_tol:
+        print(
+            f"logprob max delta {logprob_stats['max']:.6f} exceeds {args.logprob_max_tol:.6f}",
+            file=sys.stderr,
+        )
+        return 1
+    if hf["logit_max_abs_diff_vs_base"] < args.min_hf_logit_delta:
         print("adapter did not change HF logits", file=sys.stderr)
         return 1
     return 0
