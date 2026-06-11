@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -347,6 +348,15 @@ def start_server(args: argparse.Namespace, repo_root: Path) -> subprocess.Popen:
     return process
 
 
+def assert_port_available(port: int) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        if sock.connect_ex(("127.0.0.1", port)) == 0:
+            raise RuntimeError(
+                f"port {port} is already accepting connections; stop the stale server or choose another port"
+            )
+
+
 def stop_server(process: subprocess.Popen | None) -> None:
     if process is None or process.poll() is not None:
         return
@@ -542,6 +552,7 @@ def main() -> int:
 
         server_url = args.server_url or f"http://127.0.0.1:{args.port}"
         if args.server_url is None:
+            assert_port_available(args.port)
             process = start_server(args, repo_root)
         try:
             wait_for_health(server_url, args.startup_timeout_s, process)
